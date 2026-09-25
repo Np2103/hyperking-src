@@ -1,0 +1,13 @@
+# Install torch FIRST and separately, matching your server's CUDA version —
+# see RUN_PROCEDURE.md step 4. Do NOT just pip install torch from this file,
+# the generic PyPI wheel may not have CUDA support.
+
+pennylane>=0.36
+pennylane-lightning>=0.36     # fast CPU quantum simulator backend
+numpy
+scipy
+spectral
+scikit-learn
+matplotlib
+opacus                        # if you're using it for the DP side, harmless if unused
+tqdm
