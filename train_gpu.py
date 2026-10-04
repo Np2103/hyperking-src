@@ -118,16 +118,20 @@ class Generator(torch.nn.Module):
         # First-half module already owns its own Stage 1 / Stage 2 DNC.
         self.first_half.step_dnc(current_epoch, total_epochs,
                                   discriminator_loss=discriminator_loss)
-        self.stage3_dnc.step(current_epoch, total_epochs,
-                              discriminator_loss=discriminator_loss)
+        if discriminator_loss is not None:
+            self.stage3_dnc.update_from_discriminator_loss(discriminator_loss)
+        _, _, e3 = self.stage3_dnc.compute_epsilons(current_epoch, total_epochs)
+        self._epsilon_3 = e3
 
     def forward(self, x):
         x = self.first_half(x)          # DC -> Reshape -> Core Quantum FE (+DNC stage1/2)
         x = self.inverse_qc(x)          # Inverse-QC
         x = self.low_rank(x)            # Low-rank -> 172x128x128
         if self.training:
-            eps3 = self.stage3_dnc.get_epsilon_3()
-            x = self.stage3_noise(x, epsilon=eps3)   # Novelty 1, Stage 3
+            eps3 = getattr(self, "_epsilon_3", None)
+            if eps3 is not None:
+                self.stage3_noise.set_epsilon(eps3)
+            x = self.stage3_noise(x)   # Novelty 1, Stage 3  # Novelty 1, Stage 3
         return x
 
 
@@ -314,7 +318,7 @@ def main():
         eps = generator.first_half.dnc if hasattr(generator.first_half, "dnc") else None
         eps1 = getattr(eps, "epsilon_1", None) if eps else None
         eps2 = getattr(eps, "epsilon_2", None) if eps else None
-        eps3 = generator.stage3_dnc.get_epsilon_3() if hasattr(generator.stage3_dnc, "get_epsilon_3") else None
+               eps3 = getattr(generator, "_epsilon_3", None)
 
         print(f"[epoch {epoch:4d}/{args.epochs}] g_loss={avg_g:.5f} "
               f"d_loss={avg_d if train_d_this_epoch else 'skip':>8} "
