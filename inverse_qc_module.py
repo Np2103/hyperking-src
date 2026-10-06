@@ -94,6 +94,11 @@ class InverseQCModule(nn.Module):
 
     def forward(self, x):
         # x: (batch, 64, 2, 2)
+        # FIX: the quantum layer (lightning.qubit) returns a CPU tensor, while
+        # this module's weights live on the GPU. Move the input to the module's
+        # device (and force float32, since PennyLane may return float64).
+        x = x.to(next(self.parameters()).device, dtype=torch.float32)
+
         x = self.tconv1(x)                      # (batch, 64, 2, 2)
         x = self._upsample_to(x, (20, 20))       # (batch, 64, 20, 20)
 
