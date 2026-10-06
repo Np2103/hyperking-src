@@ -1,62 +1,23 @@
 """
 train_gpu.py
 ================================================================
-HyperKING Federated-Privacy Project — GPU SERVER TRAINING SCRIPT
+HyperKING Federated-Privacy Project - GPU TRAINING SCRIPT
 ================================================================
 
-This replaces your Colab notebook cells with a single script meant to be
-run directly on a Linux GPU server via SSH (no notebook, no Drive mount).
+Fixes in this version:
+  1. Device mismatch: quantum modules (lightning.qubit) run on the CPU.
+     Their outputs are now moved back to the GPU before the next layer
+     (Generator: before Inverse-QC, Discriminator: before Sigmoid).
+  2. Input to the Discriminator's quantum classifier is moved to CPU first.
+  3. Uses the new torch.amp API (no more FutureWarnings).
+  4. Plain ASCII text only (no weird characters on Windows).
 
-WHAT THIS SCRIPT ASSUMES ABOUT YOUR REPO (github.com/Np2103/hyperking-src)
----------------------------------------------------------------
-Based on what you've built so far, this script imports:
+USAGE
+-----
+    python train_gpu.py --data-dir .\\patches_400 --checkpoint-dir .\\checkpoints --log-dir .\\logs --epochs 2300 --batch-size 2 --checkpoint-every 25 --qdevice lightning.qubit
 
-    patch_dataset.py      -> PatchDataset(patches_dir=..., ...)
-    generator.py           -> GeneratorFirstHalf
-                               .step_dnc(current_epoch, total_epochs, discriminator_loss=None)
-    inverse_qc_module.py   -> InverseQCModule
-    lowrank_module.py      -> LowRankModule
-    noise_injector.py      -> NoiseInjector          (Stage 3, post-reconstruction)
-    dnc_analyzer.py        -> DNCAnalyzer            (epsilon_1, epsilon_2, epsilon_3)
-    ds_module.py           -> DSModule               (Discriminator start)
-    he_quantum_classifier.py -> HEQuantumClassifier
-    sigmoid_module.py      -> SigmoidModule
-    losses.py              -> generator_loss(...), discriminator_loss(...)
-
->>> IMPORTANT: If any of these class/function names differ in your actual
->>> files (e.g. you called it "InverseQC" instead of "InverseQCModule"),
->>> just fix the import lines in the "IMPORTS FROM YOUR REPO" section below.
->>> Everything else (device handling, checkpointing, epoch loop, logging)
->>> does not depend on those exact names.
-
-WHAT THIS SCRIPT ADDS ON TOP OF YOUR COLAB train.py
-----------------------------------------------------
-1. Proper CUDA device handling (.to(device) everywhere, works with 0 or
-   many GPUs on the server, falls back to CPU with a warning if no GPU).
-2. Command-line arguments instead of hardcoded Colab paths.
-3. Checkpointing every N epochs (resumable — critical for a 2300-epoch
-   run in case the server reboots, the SSH session dies, or you hit a
-   time limit on a shared college server).
-4. CSV loss logging (so you can plot G/D loss afterwards without re-running).
-5. Graceful handling of SIGTERM (many HPC job schedulers send this before
-   killing a job — this saves a checkpoint first instead of losing progress).
-6. A configurable PennyLane device (lightning.qubit / lightning.gpu) since
-   plain default.qubit is pure Python and is very likely your real
-   speed bottleneck, not "CPU vs GPU" for the classical layers.
-
-USAGE (see RUN_PROCEDURE.md for the full walkthrough)
-------------------------------------------------------
-    python3 train_gpu.py \\
-        --data-dir /home/youruser/hyperking/patches \\
-        --checkpoint-dir /home/youruser/hyperking/checkpoints \\
-        --log-dir /home/youruser/hyperking/logs \\
-        --epochs 2300 \\
-        --batch-size 4 \\
-        --alternate-period 5 \\
-        --qdevice lightning.qubit
-
-Resume after interruption (auto-detects the latest checkpoint):
-    python3 train_gpu.py --data-dir ... --checkpoint-dir ... --resume
+Resume after interruption:
+    python train_gpu.py --data-dir .\\patches_400 --checkpoint-dir .\\checkpoints --log-dir .\\logs --epochs 2300 --batch-size 2 --checkpoint-every 25 --qdevice lightning.qubit --resume
 """
 
 import os
@@ -73,8 +34,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 # ----------------------------------------------------------------------
-# IMPORTS FROM YOUR REPO  (clone hyperking-src next to this script, or
-# add it to PYTHONPATH — see RUN_PROCEDURE.md step 3)
+# IMPORTS FROM YOUR REPO
 # ----------------------------------------------------------------------
 try:
     from patch_dataset import PatchDataset
@@ -89,20 +49,19 @@ try:
     from losses import generator_loss, discriminator_loss
 except ImportError as e:
     print("=" * 70)
-    print("IMPORT ERROR — a module from your hyperking-src repo was not found.")
+    print("IMPORT ERROR - a module from your hyperking-src repo was not found.")
     print(f"  Missing: {e}")
-    print("Fix: either the class name in this script doesn't match your file,")
-    print("     or the repo isn't on PYTHONPATH yet. See RUN_PROCEDURE.md step 3.")
     print("=" * 70)
     sys.exit(1)
 
 
+def _device_of(module):
+    """Return the device where a module's weights live."""
+    return next(module.parameters()).device
+
+
 # ----------------------------------------------------------------------
-# Model wrappers — combine your existing building blocks into a full
-# Generator and full Discriminator, mirroring what your Colab train.py
-# already wires together. If your train.py builds these differently,
-# copy YOUR wiring into these two classes instead — the rest of the
-# script (training loop, checkpointing, device handling) stays the same.
+# Models
 # ----------------------------------------------------------------------
 
 class Generator(torch.nn.Module):
@@ -115,23 +74,27 @@ class Generator(torch.nn.Module):
         self.stage3_noise = NoiseInjector()
 
     def step_dnc(self, current_epoch, total_epochs, discriminator_loss=None):
-        # First-half module already owns its own Stage 1 / Stage 2 DNC.
         self.first_half.step_dnc(current_epoch, total_epochs,
-                                  discriminator_loss=discriminator_loss)
+                                 discriminator_loss=discriminator_loss)
         if discriminator_loss is not None:
             self.stage3_dnc.update_from_discriminator_loss(discriminator_loss)
         _, _, e3 = self.stage3_dnc.compute_epsilons(current_epoch, total_epochs)
         self._epsilon_3 = e3
 
     def forward(self, x):
-        x = self.first_half(x)          # DC -> Reshape -> Core Quantum FE (+DNC stage1/2)
-        x = self.inverse_qc(x)          # Inverse-QC
-        x = self.low_rank(x)            # Low-rank -> 172x128x128
+        # DC -> Reshape -> Core Quantum FE (+ DNC stage 1/2)
+        x = self.first_half(x)
+        # Quantum output may come back on CPU -> move to the GPU
+        x = x.to(_device_of(self.inverse_qc))
+        # Inverse-QC
+        x = self.inverse_qc(x)
+        # Low-rank -> 172x128x128
+        x = self.low_rank(x)
         if self.training:
             eps3 = getattr(self, "_epsilon_3", None)
             if eps3 is not None:
                 self.stage3_noise.set_epsilon(eps3)
-            x = self.stage3_noise(x)   # Novelty 1, Stage 3  # Novelty 1, Stage 3
+            x = self.stage3_noise(x)  # Novelty 1, Stage 3
         return x
 
 
@@ -143,8 +106,12 @@ class Discriminator(torch.nn.Module):
         self.sigmoid = SigmoidModule()
 
     def forward(self, x):
+        gpu_device = _device_of(self.sigmoid)
         x = self.ds(x)
-        x = self.he_classifier(x)
+        # Quantum classifier runs on CPU -> send input to CPU
+        x = self.he_classifier(x.cpu())
+        # Bring the quantum output back to the GPU, as float32
+        x = x.to(gpu_device).float()
         x = self.sigmoid(x)
         return x
 
@@ -165,20 +132,17 @@ def save_checkpoint(path, epoch, generator, discriminator, opt_g, opt_d):
 
 def find_latest_checkpoint(checkpoint_dir):
     ckpts = sorted(Path(checkpoint_dir).glob("epoch_*.pt"),
-                    key=lambda p: int(p.stem.split("_")[1]))
+                   key=lambda p: int(p.stem.split("_")[1]))
     return ckpts[-1] if ckpts else None
 
 
-# ----------------------------------------------------------------------
-# Graceful shutdown: if the server / job scheduler sends SIGTERM,
-# save a checkpoint before the process is killed instead of losing progress.
-# ----------------------------------------------------------------------
-
 _shutdown_requested = {"flag": False}
 
+
 def _handle_sigterm(signum, frame):
-    print("\n[signal] SIGTERM received — will checkpoint at end of current epoch and exit.")
+    print("\n[signal] SIGTERM received - will checkpoint at end of current epoch and exit.")
     _shutdown_requested["flag"] = True
+
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -188,29 +152,21 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 # ----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="HyperKING GAN training on GPU server")
-    parser.add_argument("--data-dir", required=True, help="Path to folder of .npy patches on THIS server")
-    parser.add_argument("--checkpoint-dir", required=True, help="Where to save/resume checkpoints")
-    parser.add_argument("--log-dir", default="./logs", help="Where to write loss_log.csv")
+    parser = argparse.ArgumentParser(description="HyperKING GAN training")
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--checkpoint-dir", required=True)
+    parser.add_argument("--log-dir", default="./logs")
     parser.add_argument("--epochs", type=int, default=2300)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=5e-5, help="RMSprop learning rate")
-    parser.add_argument("--alternate-period", type=int, default=5,
-                         help="Train G every epoch; train D every Nth epoch after warmup (matches base paper schedule)")
-    parser.add_argument("--warmup-g-epochs", type=int, default=5,
-                         help="Epochs to train G alone before alternating with D")
-    parser.add_argument("--checkpoint-every", type=int, default=25,
-                         help="Save a checkpoint every N epochs")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--alternate-period", type=int, default=5)
+    parser.add_argument("--warmup-g-epochs", type=int, default=5)
+    parser.add_argument("--checkpoint-every", type=int, default=25)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--qdevice", default="lightning.qubit",
-                         choices=["default.qubit", "lightning.qubit", "lightning.gpu"],
-                         help="PennyLane backend for the quantum modules. "
-                              "lightning.qubit is usually the best CPU speedup with no extra setup. "
-                              "lightning.gpu requires NVIDIA cuQuantum installed separately.")
-    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in --checkpoint-dir")
-    parser.add_argument("--amp", action="store_true",
-                         help="Use mixed precision for the classical (non-quantum) layers. "
-                              "Leave off the first time — the quantum layers may not support autocast cleanly.")
+                        choices=["default.qubit", "lightning.qubit", "lightning.gpu"])
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--amp", action="store_true")
     args = parser.parse_args()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -222,16 +178,16 @@ def main():
         print(f"[device] Using GPU: {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device("cpu")
-        print("[device] WARNING: no CUDA GPU detected — training will run on CPU and be slow. "
-              "Check `nvidia-smi` on the server and that torch was installed with CUDA support.")
+        print("[device] WARNING: no CUDA GPU detected - training will run on CPU and be slow.")
 
     # ---------------- Data ----------------
     print(f"[data] Loading patches from {args.data_dir}")
     dataset = PatchDataset(patches_dir=args.data_dir)
     print(f"[data] {len(dataset)} patches found")
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
-                         drop_last=True)
+                        num_workers=args.num_workers,
+                        pin_memory=(device.type == "cuda"),
+                        drop_last=True)
 
     # ---------------- Models ----------------
     generator = Generator(qdevice=args.qdevice).to(device)
@@ -253,7 +209,7 @@ def main():
             start_epoch = ckpt["epoch"] + 1
             print(f"[resume] Resuming from epoch {start_epoch}")
         else:
-            print("[resume] --resume was passed but no checkpoint found — starting fresh.")
+            print("[resume] --resume was passed but no checkpoint found - starting fresh.")
 
     # ---------------- Logging ----------------
     log_path = os.path.join(args.log_dir, "loss_log.csv")
@@ -261,9 +217,11 @@ def main():
     log_file = open(log_path, "a", newline="")
     log_writer = csv.writer(log_file)
     if write_header:
-        log_writer.writerow(["epoch", "g_loss", "d_loss", "epsilon_1", "epsilon_2", "epsilon_3", "seconds"])
+        log_writer.writerow(["epoch", "g_loss", "d_loss", "epsilon_1",
+                             "epsilon_2", "epsilon_3", "seconds"])
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     print(f"[train] Starting training: epochs {start_epoch} -> {args.epochs - 1}, "
           f"batch size {args.batch_size}, {len(loader)} batches/epoch")
@@ -276,7 +234,7 @@ def main():
         generator.step_dnc(current_epoch=epoch, total_epochs=args.epochs)
 
         train_d_this_epoch = (epoch >= args.warmup_g_epochs and
-                               (epoch - args.warmup_g_epochs) % args.alternate_period == 0)
+                              (epoch - args.warmup_g_epochs) % args.alternate_period == 0)
 
         running_g, running_d, n_batches = 0.0, 0.0, 0
 
@@ -286,7 +244,7 @@ def main():
 
             # ---- Train Generator ----
             opt_g.zero_grad()
-            with torch.cuda.amp.autocast(enabled=args.amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 restored = generator(corrupted)
                 d_pred_fake = discriminator(restored)
                 g_loss = generator_loss(restored, clean, d_pred_fake)
@@ -294,19 +252,17 @@ def main():
             scaler.step(opt_g)
             scaler.update()
 
-            d_loss_value = None
             # ---- Train Discriminator (only on alternation epochs) ----
             if train_d_this_epoch:
                 opt_d.zero_grad()
-                with torch.cuda.amp.autocast(enabled=args.amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     d_pred_real = discriminator(clean)
                     d_pred_fake_detached = discriminator(restored.detach())
                     d_loss = discriminator_loss(d_pred_real, d_pred_fake_detached)
                 scaler.scale(d_loss).backward()
                 scaler.step(opt_d)
                 scaler.update()
-                d_loss_value = d_loss.item()
-                running_d += d_loss_value
+                running_d += d_loss.item()
 
             running_g += g_loss.item()
             n_batches += 1
@@ -318,16 +274,18 @@ def main():
         eps = generator.first_half.dnc if hasattr(generator.first_half, "dnc") else None
         eps1 = getattr(eps, "epsilon_1", None) if eps else None
         eps2 = getattr(eps, "epsilon_2", None) if eps else None
-               eps3 = getattr(generator, "_epsilon_3", None)
+        eps3 = getattr(generator, "_epsilon_3", None)
 
+        d_text = f"{avg_d:.5f}" if train_d_this_epoch else "skip"
         print(f"[epoch {epoch:4d}/{args.epochs}] g_loss={avg_g:.5f} "
-              f"d_loss={avg_d if train_d_this_epoch else 'skip':>8} "
-              f"time={elapsed:.1f}s")
+              f"d_loss={d_text:>8} time={elapsed:.1f}s")
 
         log_writer.writerow([epoch, avg_g, avg_d, eps1, eps2, eps3, round(elapsed, 2)])
         log_file.flush()
 
-        if (epoch + 1) % args.checkpoint_every == 0 or epoch == args.epochs - 1 or _shutdown_requested["flag"]:
+        if ((epoch + 1) % args.checkpoint_every == 0
+                or epoch == args.epochs - 1
+                or _shutdown_requested["flag"]):
             ckpt_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt")
             save_checkpoint(ckpt_path, epoch, generator, discriminator, opt_g, opt_d)
             print(f"[checkpoint] Saved {ckpt_path}")
@@ -345,7 +303,7 @@ if __name__ == "__main__":
         main()
     except Exception:
         print("=" * 70)
-        print("TRAINING CRASHED — full traceback below. Your last checkpoint is safe")
+        print("TRAINING CRASHED - full traceback below. Your last checkpoint is safe")
         print("in --checkpoint-dir; re-run with --resume to continue from there.")
         print("=" * 70)
         traceback.print_exc()
